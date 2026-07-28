@@ -1,0 +1,26 @@
+# Data — scraped HTML cache, parsed tables, model artifacts
+data/
+models/
+*.parquet
+*.duckdb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
