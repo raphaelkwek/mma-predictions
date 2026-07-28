@@ -22,8 +22,8 @@ Design phase. See `docs/superpowers/specs/` for the design document.
 ## Layout
 
 ```
-data/          raw HTML cache and parsed parquet tables (gitignored)
-src/           the package: scrapers, parsers, features, models, backtest
+data/          downloaded source files and parsed parquet tables (gitignored)
+src/mma/       the package: data, parsers, features, models, backtest
 notebooks/     thin exploration and results notebooks (call the package, never redefine it)
 tests/         parser fixtures, leakage assertions, backtest accounting
 dashboard/     Streamlit app

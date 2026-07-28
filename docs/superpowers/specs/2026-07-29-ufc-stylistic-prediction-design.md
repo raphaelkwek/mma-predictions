@@ -48,24 +48,25 @@ Five stages, each writing a persisted artifact so any stage can be re-run withou
 redoing its predecessor:
 
 ```
-scrape → parse → canonical tables → as-of features → models → evaluation/backtest
+download → parse → canonical tables → as-of features → models → evaluation/backtest
                                                                      ↓
                                                                dashboard
 ```
 
-Raw HTML is cached to disk before parsing. This is not premature optimization: parser
-bugs are discovered late (a mis-parsed control-time field, a method string that only
-appears twice in the corpus), and re-parsing a local cache takes seconds where
-re-scraping takes hours and hammers someone else's server.
+Source files are downloaded once and cached on disk before parsing. Parser bugs surface
+late — a method string that appears twice in thirty years of results, a column that
+changed type upstream — and re-parsing a local cache takes seconds where re-downloading
+is slow and rude.
 
 ### Repository layout
 
 ```
-data/            raw HTML cache, parsed parquet tables (gitignored)
-src/             the package
-  scrape/        ufcstats fetchers, rate limiting, cache
-  parse/         HTML → tabular
-  canonical/     schema definitions, entity resolution, odds join
+data/            downloaded source files, parsed parquet tables (gitignored)
+src/mma/         the package
+  data/          source registry and cached downloads
+  parse/         one module per source file → tidy frames
+  canonical/     name normalization, join keys, table assembly
+  audit/         coverage and bias reporting
   features/      as-of feature builders (baseline, style, interaction, archetype)
   models/        training, calibration, method-of-victory
   backtest/      walk-forward harness, staking, bootstrap CIs
@@ -79,12 +80,38 @@ docs/            design docs and specs
 
 ### Sources
 
-- **Fight stats and fighter attributes:** scraped from ufcstats.com. Free, canonical,
-  and the only public source with per-round positional strike breakdowns. Scraping is
-  sequential, rate-limited, cached, and uses an identifying user-agent.
-- **Historical closing moneylines:** bootstrapped from a public dataset (Kaggle or
-  equivalent). Identifying the specific dataset is a Phase 1 task with acceptance
-  criteria below, not an assumption of this design.
+**Revised 2026-07-29.** The original design scraped ufcstats.com directly. That is not
+available: the site serves a JavaScript proof-of-work bot challenge on every URL, and
+defeating bot detection is out of bounds. There is no `robots.txt`; the challenge is the
+site's access signal. All data therefore comes from published, redistributable datasets.
+
+- **Fight stats — [mtoto/ufc.stats](https://github.com/mtoto/ufc.stats)** (MIT). 27,668
+  rows at fighter-×-round granularity, actively maintained, covering 1994 to present.
+  Carries the positional (`distance`/`clinch`/`ground`) and target (`head`/`body`/`leg`)
+  strike splits the style features depend on, plus knockdowns, takedowns, submission
+  attempts and reversals. Distributed as an R `.rda`, read via `pyreadr`.
+- **Fight results — `ufc_fights.csv`** (TidyTuesday 2026-07-07). 8,736 fights,
+  1994-03-11 to 2026-06-27. Supplies the canonical UFCStats fight id via `fight_url`,
+  plus method, time format and referee.
+- **Closing moneylines — `ultimate_ufc_dataset.csv`** (TidyTuesday 2026-07-07). 7,177
+  fights. **Only** `r_fighter`, `b_fighter`, `date`, `r_odds`, `b_odds` are used. Its
+  ~90 pre-computed career-average columns have undocumented as-of semantics and are
+  discarded at the parsing boundary as a leakage risk.
+- **Static physicals — `ufc_athletes.csv`** (TidyTuesday 2026-07-07). Height, reach,
+  stance and date of birth only. These do not change over time and are safe from any
+  fight date's perspective. The career *rate* columns in the same file describe the
+  fighter as of today and are discarded for the same reason as above.
+
+**Consequences of the change.** Two capabilities are lost. First, we no longer own the
+parse from raw HTML, so data quality depends on upstream maintainers. Second, refreshing
+predictions for an upcoming card is bounded by the publishers' update cadence rather than
+being on demand — `mtoto/ufc.stats` is currently updated within days of each event, which
+is adequate but not guaranteed.
+
+**One feature is lost outright:** the round-level source has no control-time column.
+Ground control share was specified in the style profile and is not recoverable from these
+sources. Grappling is represented instead by takedowns, ground strikes, submission
+attempts and reversals. No substitute is invented.
 
 ### Canonical schema
 
@@ -97,7 +124,7 @@ NC), end round, end time.
 **`fight_stats`** — long format, one row per fight_id × fighter_id × round × stat:
 knockdowns; significant strikes landed and attempted, split by **target** (head/body/leg)
 and by **position** (distance/clinch/ground); total strikes; takedowns landed and
-attempted; submission attempts; reversals; control time.
+attempted; submission attempts; reversals.
 
 The position and target breakdowns are the raw material for style. They are what separate
 a distance point-fighter from a clinch grinder from a top-control grappler, and no other
@@ -107,12 +134,18 @@ field in the dataset carries that information.
 
 ### Entity resolution and the coverage gate
 
-Odds data is keyed by fighter name and event date; UFCStats is keyed by its own ids.
-Names disagree systematically — diacritics (José/Jose), suffixes (Jr./Sr.), nicknames
-embedded in the name field, and inconsistent ordering for Brazilian and Korean fighters.
-The join therefore needs normalization plus fuzzy matching constrained by event date and
-weight class, with ambiguous matches surfaced for manual review rather than silently
-resolved.
+Every source is keyed by fighter name and event date rather than by a shared id. The join
+key is therefore `(date, both normalized names sorted alphabetically)` — sorted because
+sources disagree about which fighter is listed first, and an order-dependent key would
+fail to match roughly half of all fights.
+
+Name normalization is deliberately conservative: case, accents, punctuation and
+whitespace only. It does **not** strip suffixes, because "Antonio Carlos Junior" and
+"Junior dos Santos" are real fighter names in which the suffix-looking token is part of
+the name, and a generic rule would corrupt them into different people. Residual
+mismatches are resolved by an explicit reviewed alias table, never by fuzzy matching —
+an incorrect alias silently merges two fighters' histories, which does more damage than
+an unmatched row.
 
 **Phase 1 exit gate.** Produce a coverage report: the fraction of fights from 2010 onward
 with a matched closing line, plus a breakdown of *unmatched* fights by year, card position,
@@ -157,8 +190,11 @@ debut flag.
 
 **2. Style profile** — per fighter, as of the fight date. Strike volume, accuracy, strikes
 absorbed, striking defense; distance/clinch/ground strike mix; head/body/leg mix; takedown
-attempt rate, accuracy, defense; submission attempts per 15 minutes; control-time share;
+attempt rate, accuracy, defense; submission attempts per 15 minutes; reversal rate;
 knockdown rate; finish rate; average fight duration.
+
+Control-time share was specified here originally and has been removed: no available
+source carries it (see Sources).
 
 Each is computed two ways: **career to date** and a **recency-weighted recent window**.
 Fighters change. A wrestler who reinvented himself as a striker three fights ago should
@@ -242,11 +278,13 @@ the ladder is what makes it defensible.
 
 ## Testing
 
-Concentrated where failures are silent rather than loud. A broken scraper announces
+Concentrated where failures are silent rather than loud. A failed download announces
 itself; a leaking feature looks like success.
 
-- Parser tests against saved HTML fixtures, including known-awkward fights (no contest,
-  DQ, overturned result, five-round main event).
+- Parser tests on synthetic frames, including known-awkward fights (no contest, DQ,
+  overturned result, five-round main event), plus schema assertions that fail loudly if
+  an upstream release drops a column the style features depend on.
+- A guard test asserting no quarantined career-aggregate column survives parsing.
 - As-of leakage assertions and a golden-value feature test.
 - Corner symmetry: `P(A beats B) + P(B beats A) = 1`.
 - Elo update correctness against hand-computed values.
@@ -262,8 +300,9 @@ pytest, Streamlit, Plotly.
 
 Each phase ends in a reviewable artifact.
 
-1. **Data and coverage audit.** Scrapers, parsers, canonical tables, odds join, coverage
-   report. **Gate:** odds coverage acceptable per the criteria above.
+1. **Data and coverage audit.** Cached downloads, parsers, canonical tables, odds join,
+   coverage report. **Gate:** odds coverage acceptable per the criteria above.
+   Planned in `docs/superpowers/plans/2026-07-29-phase-1-data-foundation.md`.
 2. **Baseline model.** Elo and physicals, as-of feature builder, walk-forward harness,
    market benchmark wired in, leakage tests passing.
 3. **Style, interactions, archetypes.** The full ablation ladder.
@@ -278,8 +317,9 @@ Each phase ends in a reviewable artifact.
 
 ## Decisions deliberately deferred
 
-- The specific odds dataset, pending the Phase 1 audit.
 - Whether method-of-victory gets a betting evaluation, pending prop-line availability.
+  None of the four adopted sources carries historical method or inside-the-distance
+  lines, so this currently looks unlikely; method would then be scored on log-loss only.
 - Opponent-adjusted style statistics (correcting for strength of schedule). A real
   improvement — a 60% takedown defense against journeymen is not the same as against
   contenders — but it is an iteration on Phase 3, not a prerequisite.
